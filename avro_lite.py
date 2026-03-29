@@ -1,95 +1,109 @@
 #!/usr/bin/env python3
-"""Apache Avro-style schema-based binary encoder/decoder."""
-import sys, struct, json
+"""Minimal Avro binary encoder/decoder."""
+import struct
 
-def encode_varint(n):
+def _encode_varint(n):
     n = (n << 1) ^ (n >> 63)  # zigzag
     result = bytearray()
-    while n > 0x7F: result.append((n & 0x7F) | 0x80); n >>= 7
-    result.append(n & 0x7F); return bytes(result)
+    while n > 0x7f:
+        result.append((n & 0x7f) | 0x80)
+        n >>= 7
+    result.append(n & 0x7f)
+    return bytes(result)
 
-def decode_varint(data, offset):
+def _decode_varint(data, pos):
     result = 0; shift = 0
     while True:
-        b = data[offset]; offset += 1
-        result |= (b & 0x7F) << shift; shift += 7
+        b = data[pos]; pos += 1
+        result |= (b & 0x7f) << shift
         if not (b & 0x80): break
-    return (result >> 1) ^ -(result & 1), offset  # zigzag decode
+        shift += 7
+    return (result >> 1) ^ -(result & 1), pos  # zigzag decode
 
-def encode_value(schema, value):
-    t = schema if isinstance(schema, str) else schema.get("type", "null")
-    if t == "null": return b""
-    if t == "boolean": return b"\x01" if value else b"\x00"
-    if t == "int" or t == "long": return encode_varint(value)
-    if t == "float": return struct.pack("<f", value)
-    if t == "double": return struct.pack("<d", value)
-    if t == "string":
-        b = value.encode(); return encode_varint(len(b)) + b
-    if t == "bytes": return encode_varint(len(value)) + value
-    if t == "array":
-        items_schema = schema["items"]; result = bytearray()
-        if value: result.extend(encode_varint(len(value)))
-        for item in value: result.extend(encode_value(items_schema, item))
-        result.extend(b"\x00"); return bytes(result)
-    if t == "record":
-        result = bytearray()
+def encode_value(schema, value) -> bytes:
+    if schema == "null": return b""
+    if schema == "boolean": return b"\x01" if value else b"\x00"
+    if schema == "int" or schema == "long": return _encode_varint(value)
+    if schema == "float": return struct.pack("<f", value)
+    if schema == "double": return struct.pack("<d", value)
+    if schema == "string":
+        b = value.encode()
+        return _encode_varint(len(b)) + b
+    if schema == "bytes":
+        return _encode_varint(len(value)) + value
+    if isinstance(schema, dict) and schema.get("type") == "record":
+        result = b""
         for field in schema["fields"]:
-            result.extend(encode_value(field["type"], value.get(field["name"])))
-        return bytes(result)
-    if t == "map":
-        vals_schema = schema["values"]; result = bytearray()
-        if value: result.extend(encode_varint(len(value)))
-        for k, v in value.items():
-            result.extend(encode_value("string", k))
-            result.extend(encode_value(vals_schema, v))
-        result.extend(b"\x00"); return bytes(result)
-    return b""
+            result += encode_value(field["type"], value[field["name"]])
+        return result
+    if isinstance(schema, dict) and schema.get("type") == "array":
+        items = schema["items"]
+        if len(value) == 0: return _encode_varint(0)
+        result = _encode_varint(len(value))
+        for item in value:
+            result += encode_value(items, item)
+        result += _encode_varint(0)
+        return result
+    raise ValueError(f"Unsupported schema: {schema}")
 
-def decode_value(schema, data, offset):
-    t = schema if isinstance(schema, str) else schema.get("type", "null")
-    if t == "null": return None, offset
-    if t == "boolean": return bool(data[offset]), offset + 1
-    if t == "int" or t == "long": return decode_varint(data, offset)
-    if t == "float": return struct.unpack_from("<f", data, offset)[0], offset + 4
-    if t == "double": return struct.unpack_from("<d", data, offset)[0], offset + 8
-    if t == "string":
-        length, offset = decode_varint(data, offset)
-        return data[offset:offset+length].decode(), offset + length
-    if t == "bytes":
-        length, offset = decode_varint(data, offset)
-        return data[offset:offset+length], offset + length
-    if t == "array":
-        items = []; items_schema = schema["items"]
-        while True:
-            count, offset = decode_varint(data, offset)
-            if count == 0: break
-            for _ in range(count):
-                val, offset = decode_value(items_schema, data, offset)
-                items.append(val)
-        return items, offset
-    if t == "record":
+def decode_value(schema, data, pos=0):
+    if schema == "null": return None, pos
+    if schema == "boolean": return data[pos] != 0, pos + 1
+    if schema == "int" or schema == "long": return _decode_varint(data, pos)
+    if schema == "float": return struct.unpack("<f", data[pos:pos+4])[0], pos + 4
+    if schema == "double": return struct.unpack("<d", data[pos:pos+8])[0], pos + 8
+    if schema == "string":
+        length, pos = _decode_varint(data, pos)
+        return data[pos:pos+length].decode(), pos + length
+    if schema == "bytes":
+        length, pos = _decode_varint(data, pos)
+        return data[pos:pos+length], pos + length
+    if isinstance(schema, dict) and schema.get("type") == "record":
         result = {}
         for field in schema["fields"]:
-            val, offset = decode_value(field["type"], data, offset)
-            result[field["name"]] = val
-        return result, offset
-    return None, offset
+            result[field["name"]], pos = decode_value(field["type"], data, pos)
+        return result, pos
+    if isinstance(schema, dict) and schema.get("type") == "array":
+        items_schema = schema["items"]
+        result = []
+        while True:
+            count, pos = _decode_varint(data, pos)
+            if count == 0: break
+            for _ in range(abs(count)):
+                val, pos = decode_value(items_schema, data, pos)
+                result.append(val)
+        return result, pos
+    raise ValueError(f"Unsupported schema: {schema}")
 
-def main():
-    print("=== Avro Lite ===\n")
-    schema = {"type": "record", "name": "User", "fields": [
-        {"name": "name", "type": "string"}, {"name": "age", "type": "int"},
-        {"name": "score", "type": "double"}, {"name": "active", "type": "boolean"},
-        {"name": "tags", "type": {"type": "array", "items": "string"}}
+if __name__ == "__main__":
+    schema = {"type": "record", "fields": [
+        {"name": "name", "type": "string"},
+        {"name": "age", "type": "int"}
     ]}
-    record = {"name": "Alice", "age": 30, "score": 95.5, "active": True, "tags": ["dev", "python"]}
-    encoded = encode_value(schema, record)
-    json_size = len(json.dumps(record).encode())
-    print(f"Schema: {schema['name']}")
-    print(f"Record: {record}")
-    print(f"Avro: {len(encoded)} bytes, JSON: {json_size} bytes ({len(encoded)/json_size*100:.0f}%)")
-    decoded, _ = decode_value(schema, encoded, 0)
-    print(f"Decoded: {decoded}")
-    print(f"Roundtrip: {'✅' if decoded['name'] == record['name'] and decoded['age'] == record['age'] else '❌'}")
+    data = encode_value(schema, {"name": "Alice", "age": 30})
+    print(f"Encoded: {data.hex()}")
+    print(f"Decoded: {decode_value(schema, data)}")
 
-if __name__ == "__main__": main()
+def test():
+    # Primitives
+    for val in [0, 1, -1, 127, -128, 10000]:
+        enc = _encode_varint(val)
+        dec, _ = _decode_varint(enc, 0)
+        assert dec == val, f"Varint failed for {val}"
+    # String
+    enc = encode_value("string", "hello")
+    dec, _ = decode_value("string", enc)
+    assert dec == "hello"
+    # Record
+    schema = {"type": "record", "fields": [
+        {"name": "x", "type": "int"}, {"name": "y", "type": "string"}
+    ]}
+    enc = encode_value(schema, {"x": 42, "y": "test"})
+    dec, _ = decode_value(schema, enc)
+    assert dec == {"x": 42, "y": "test"}
+    # Array
+    arr_schema = {"type": "array", "items": "int"}
+    enc = encode_value(arr_schema, [1, 2, 3])
+    dec, _ = decode_value(arr_schema, enc)
+    assert dec == [1, 2, 3]
+    print("  avro_lite: ALL TESTS PASSED")

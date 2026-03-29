@@ -1,13 +1,17 @@
-# Avro Lite Encoder
+# avro_lite
 
-Avro Lite Encoder — zero-dependency, single-file Python CLI.
+Minimal Apache Avro encoder/decoder
+
+Single-file, zero-dependency Python CLI tool.
 
 ## Usage
 
 ```bash
-python3 avro_lite.py --help
+python avro_lite.py --help
 ```
 
-## License
+## Test
 
-MIT
+```bash
+python -c "import avro_lite; avro_lite.test()"
+```
